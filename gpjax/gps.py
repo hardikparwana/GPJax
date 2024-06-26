@@ -518,21 +518,162 @@ class ConjugatePosterior(AbstractPosterior[PriorType, GaussianLikelihood]):
         t = test_inputs
 
         # Observation noise o²
-        obs_noise = self.likelihood.obs_stddev**2
-        mx = self.prior.mean_function(x)
+        obs_noise = self.likelihood.obs_stddev**2        # PRECOMPUTE
+        mx = self.prior.mean_function(x)               # PRECOMPUTE
 
         # Precompute Gram matrix, Kxx, at training inputs, x
-        Kxx = self.prior.kernel.gram(x)
-        Kxx += cola.ops.I_like(Kxx) * self.jitter
+        Kxx = self.prior.kernel.gram(x)               # PRECOMPUTE
+        Kxx += cola.ops.I_like(Kxx) * self.jitter     # PRECOMPUTE
 
         # Σ = Kxx + Io²
-        Sigma = Kxx + cola.ops.I_like(Kxx) * obs_noise
-        Sigma = cola.PSD(Sigma)
+        Sigma = Kxx + cola.ops.I_like(Kxx) * obs_noise  # PRECOMPUTE
+        Sigma = cola.PSD(Sigma)             # PRECOMPUTE
 
         mean_t = self.prior.mean_function(t)
         Ktt = self.prior.kernel.gram(t)
         Kxt = self.prior.kernel.cross_covariance(x, t)
-        Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+
+        Sigma_inv = jnp.linalg.inv( Sigma.to_dense() )
+        Sigma_inv_Kxt = Sigma_inv @ Kxt
+
+        # mean = mean_t + Sigma_inv_Kxt.T @ (y-mx)
+        # covariance = Ktt - Kxt.T @ Sigma_inv_Kxt
+
+        # Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+
+        # Kinv @ M
+        # M / Kinv
+
+        # μt  +  Ktx (Kxx + Io²)⁻¹ (y  -  μx)
+        mean = mean_t + jnp.matmul(Sigma_inv_Kxt.T, y - mx)
+
+        # Ktt  -  Ktx (Kxx + Io²)⁻¹ Kxt, TODO: Take advantage of covariance structure to compute Schur complement more efficiently.
+        covariance = Ktt - jnp.matmul(Kxt.T, Sigma_inv_Kxt)
+        covariance += cola.ops.I_like(covariance) * self.prior.jitter
+        covariance = cola.PSD(covariance)
+
+        return GaussianDistribution(jnp.atleast_1d(mean.squeeze()), covariance)
+    
+    def compute_sigma_inv(
+        self,
+        train_data: Dataset,
+    ) -> Array: #GaussianDistribution:
+        r"""Query the predictive posterior distribution.
+
+        Conditional on a training data set, compute the GP's posterior
+        predictive distribution for a given set of parameters. The returned function
+        can be evaluated at a set of test inputs to compute the corresponding
+        predictive density.
+        """
+        # Unpack training data
+        x, y = train_data.X, train_data.y
+
+        # Observation noise o²
+        obs_noise = self.likelihood.obs_stddev**2        # PRECOMPUTE
+        mx = self.prior.mean_function(x)               # PRECOMPUTE
+
+        # Precompute Gram matrix, Kxx, at training inputs, x
+        Kxx = self.prior.kernel.gram(x)               # PRECOMPUTE
+        Kxx += cola.ops.I_like(Kxx) * self.jitter     # PRECOMPUTE
+
+        # Σ = Kxx + Io²
+        Sigma = Kxx + cola.ops.I_like(Kxx) * obs_noise  # PRECOMPUTE
+        Sigma = cola.PSD(Sigma)             # PRECOMPUTE
+
+        Sigma_inv = jnp.linalg.inv( Sigma.to_dense() )
+
+        # mean = mean_t + Sigma_inv_Kxt.T @ (y-mx)
+        # covariance = Ktt - Kxt.T @ Sigma_inv_Kxt
+
+        # Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+
+        # Kinv @ M
+        # M / Kinv
+
+        return Sigma_inv
+    
+    def predict_with_sigma_inv(
+        self,
+        test_inputs: Num[Array, "N D"],
+        train_data: Dataset,
+        Sigma_inv: Array,
+    ) -> GaussianDistribution:
+        r"""Query the predictive posterior distribution.
+
+        Conditional on a training data set, compute the GP's posterior
+        predictive distribution for a given set of parameters. The returned function
+        can be evaluated at a set of test inputs to compute the corresponding
+        predictive density.
+
+        The predictive distribution of a conjugate GP is given by
+        $$
+            p(\mathbf{f}^{\star}\mid \mathbf{y}) & = \int p(\mathbf{f}^{\star} \mathbf{f} \mid \mathbf{y})\\
+            & =\mathcal{N}(\mathbf{f}^{\star} \boldsymbol{\mu}_{\mid \mathbf{y}}, \boldsymbol{\Sigma}_{\mid \mathbf{y}}
+        $$
+        where
+        $$
+            \boldsymbol{\mu}_{\mid \mathbf{y}} & = k(\mathbf{x}^{\star}, \mathbf{x})\left(k(\mathbf{x}, \mathbf{x}')+\sigma^2\mathbf{I}_n\right)^{-1}\mathbf{y}  \\
+            \boldsymbol{\Sigma}_{\mid \mathbf{y}} & =k(\mathbf{x}^{\star}, \mathbf{x}^{\star\prime}) -k(\mathbf{x}^{\star}, \mathbf{x})\left( k(\mathbf{x}, \mathbf{x}') + \sigma^2\mathbf{I}_n \right)^{-1}k(\mathbf{x}, \mathbf{x}^{\star}).
+        $$
+
+        The conditioning set is a GPJax `Dataset` object, whilst predictions
+        are made on a regular Jax array.
+
+        Example:
+            For a `posterior` distribution, the following code snippet will
+            evaluate the predictive distribution.
+            ```python
+                >>> import gpjax as gpx
+                >>> import jax.numpy as jnp
+                >>>
+                >>> xtrain = jnp.linspace(0, 1).reshape(-1, 1)
+                >>> ytrain = jnp.sin(xtrain)
+                >>> D = gpx.Dataset(X=xtrain, y=ytrain)
+                >>> xtest = jnp.linspace(0, 1).reshape(-1, 1)
+                >>>
+                >>> prior = gpx.gps.Prior(mean_function = gpx.mean_functions.Zero(), kernel = gpx.kernels.RBF())
+                >>> posterior = prior * gpx.likelihoods.Gaussian(num_datapoints = D.n)
+                >>> predictive_dist = posterior(xtest, D)
+            ```
+
+        Args:
+            test_inputs (Num[Array, "N D"]): A Jax array of test inputs at which the
+                predictive distribution is evaluated.
+            train_data (Dataset): A `gpx.Dataset` object that contains the input and
+                output data used for training dataset.
+
+        Returns
+        -------
+            GaussianDistribution: A function that accepts an input array and
+                returns the predictive distribution as a `GaussianDistribution`.
+        """
+        # Unpack training data
+        x, y = train_data.X, train_data.y
+
+        # Unpack test inputs
+        t = test_inputs
+
+        # Observation noise o²
+        obs_noise = self.likelihood.obs_stddev**2        # PRECOMPUTE
+        mx = self.prior.mean_function(x)               # PRECOMPUTE
+
+        # Precompute Gram matrix, Kxx, at training inputs, x
+        Kxx = self.prior.kernel.gram(x)               # PRECOMPUTE
+        Kxx += cola.ops.I_like(Kxx) * self.jitter     # PRECOMPUTE
+
+        mean_t = self.prior.mean_function(t)
+        Ktt = self.prior.kernel.gram(t)
+        Kxt = self.prior.kernel.cross_covariance(x, t)
+
+        Sigma_inv_Kxt = Sigma_inv @ Kxt
+
+        # mean = mean_t + Sigma_inv_Kxt.T @ (y-mx)
+        # covariance = Ktt - Kxt.T @ Sigma_inv_Kxt
+
+        # Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+
+        # Kinv @ M
+        # M / Kinv
 
         # μt  +  Ktx (Kxx + Io²)⁻¹ (y  -  μx)
         mean = mean_t + jnp.matmul(Sigma_inv_Kxt.T, y - mx)
