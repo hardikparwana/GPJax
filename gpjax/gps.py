@@ -509,6 +509,87 @@ class ConjugatePosterior(AbstractPosterior):
         covariance = cola.PSD(covariance)
 
         return GaussianDistribution(jnp.atleast_1d(mean.squeeze()), covariance)
+    
+    def compute_sigma_inv(
+        self,
+        train_data: Dataset,
+    ) -> Array: #GaussianDistribution:
+        r"""Query the predictive posterior distribution.
+
+        Conditional on a training data set, compute the GP's posterior
+        predictive distribution for a given set of parameters. The returned function
+        can be evaluated at a set of test inputs to compute the corresponding
+        predictive density.
+        """
+        # Unpack training data
+        x, y = train_data.X, train_data.y
+
+        # Observation noise o²
+        obs_noise = self.likelihood.obs_stddev**2        # PRECOMPUTE
+        mx = self.prior.mean_function(x)               # PRECOMPUTE
+
+        # Precompute Gram matrix, Kxx, at training inputs, x
+        Kxx = self.prior.kernel.gram(x)               # PRECOMPUTE
+        Kxx += cola.ops.I_like(Kxx) * self.jitter     # PRECOMPUTE
+
+        # Σ = Kxx + Io²
+        Sigma = Kxx + cola.ops.I_like(Kxx) * obs_noise  # PRECOMPUTE
+        Sigma = cola.PSD(Sigma)             # PRECOMPUTE
+
+        Sigma_inv = jnp.linalg.inv( Sigma.to_dense() )
+
+        # mean = mean_t + Sigma_inv_Kxt.T @ (y-mx)
+        # covariance = Ktt - Kxt.T @ Sigma_inv_Kxt
+
+        # Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+
+        # Kinv @ M
+        # M / Kinv
+
+        return Sigma_inv
+
+
+    def predict_with_sigma_inv(
+        self,
+        test_inputs: Num[Array, "N D"],
+        train_data: Dataset,
+        Sigma_inv: Array,
+    ) -> GaussianDistribution:
+        
+        # Unpack training data
+        x, y = train_data.X, train_data.y
+
+        # Unpack test inputs
+        t = test_inputs
+
+        # Observation noise o²
+        obs_noise = self.likelihood.obs_stddev**2
+        mx = self.prior.mean_function(x)
+
+        # Precompute Gram matrix, Kxx, at training inputs, x
+        Kxx = self.prior.kernel.gram(x)
+        Kxx += cola.ops.I_like(Kxx) * self.jitter
+
+        # Σ = Kxx + Io²
+        # Sigma = Kxx + cola.ops.I_like(Kxx) * obs_noise
+        # Sigma = cola.PSD(Sigma)
+
+        mean_t = self.prior.mean_function(t)
+        Ktt = self.prior.kernel.gram(t)
+        Kxt = self.prior.kernel.cross_covariance(x, t)
+
+        # Sigma_inv_Kxt = cola.solve(Sigma, Kxt)
+        Sigma_inv_Kxt = Sigma_inv @ Kxt
+
+        # μt  +  Ktx (Kxx + Io²)⁻¹ (y  -  μx)
+        mean = mean_t + jnp.matmul(Sigma_inv_Kxt.T, y - mx)
+
+        # Ktt  -  Ktx (Kxx + Io²)⁻¹ Kxt, TODO: Take advantage of covariance structure to compute Schur complement more efficiently.
+        covariance = Ktt - jnp.matmul(Kxt.T, Sigma_inv_Kxt)
+        covariance += cola.ops.I_like(covariance) * self.prior.jitter
+        covariance = cola.PSD(covariance)
+
+        return GaussianDistribution(jnp.atleast_1d(mean.squeeze()), covariance)
 
     def sample_approx(
         self,
