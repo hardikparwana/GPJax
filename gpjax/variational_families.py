@@ -182,6 +182,7 @@ class VariationalGaussian(AbstractVariationalGaussian):
                 the test inputs.
         """
         # Unpack variational parameters
+        print(f"HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO")
         mu = self.variational_mean
         sqrt = self.variational_root_covariance
         z = self.inducing_inputs
@@ -207,6 +208,93 @@ class VariationalGaussian(AbstractVariationalGaussian):
 
         # Kzz⁻¹ Kzt
         Kzz_inv_Kzt = cola.solve(Lz.T, Lz_inv_Kzt, Cholesky())
+
+        # Ktz Kzz⁻¹ sqrt
+        Ktz_Kzz_inv_sqrt = jnp.matmul(Kzz_inv_Kzt.T, sqrt)
+
+        # μt + Ktz Kzz⁻¹ (μ - μz)
+        mean = mut + jnp.matmul(Kzz_inv_Kzt.T, mu - muz)
+
+        # Ktt - Ktz Kzz⁻¹ Kzt  +  Ktz Kzz⁻¹ S Kzz⁻¹ Kzt  [recall S = sqrt sqrtᵀ]
+        covariance = (
+            Ktt
+            - jnp.matmul(Lz_inv_Kzt.T, Lz_inv_Kzt)
+            + jnp.matmul(Ktz_Kzz_inv_sqrt, Ktz_Kzz_inv_sqrt.T)
+        )
+        covariance += cola.ops.I_like(covariance) * self.jitter
+
+        return GaussianDistribution(
+            loc=jnp.atleast_1d(mean.squeeze()), scale=covariance
+        )
+    
+def compute_sigma_inv(self):
+    # Unpack variational parameters
+    mu = self.variational_mean
+    sqrt = self.variational_root_covariance
+    z = self.inducing_inputs
+
+    # Unpack mean function and kernel
+    mean_function = self.posterior.prior.mean_function
+    kernel = self.posterior.prior.kernel
+
+    Kzz = kernel.gram(z)
+    Kzz += cola.ops.I_like(Kzz) * self.jitter
+    Lz = lower_cholesky(Kzz)
+    muz = mean_function(z)
+
+    Lz_inv = jnp.linalg.inv( Lz.to_dense() )
+
+    return Lz_inv, muz
+
+
+    
+def predict_with_Sigma_inv(self, test_inputs: Float[Array, "N D"], Lz_inv, muz) -> GaussianDistribution:
+        r"""Compute the predictive distribution of the GP at the test inputs t.
+
+        This is the integral $`q(f(t)) = \int p(f(t)\mid u) q(u) \mathrm{d}u`$, which
+        can be computed in closed form as:
+        ```math
+            \mathcal{N}\left(f(t); \mu t + \mathbf{K}_{tz} \mathbf{K}_{zz}^{-1} (\mu - \mu z),  \mathbf{K}_{tt} - \mathbf{K}_{tz} \mathbf{K}_{zz}^{-1} \mathbf{K}_{zt} + \mathbf{K}_{tz} \mathbf{K}_{zz}^{-1} S \mathbf{K}_{zz}^{-1} \mathbf{K}_{zt}\right).
+        ```
+
+        Args:
+            test_inputs (Float[Array, "N D"]): The test inputs at which we wish to
+                make a prediction.
+
+        Returns
+        -------
+            GaussianDistribution: The predictive distribution of the low-rank GP at
+                the test inputs.
+        """
+        # Unpack variational parameters
+        mu = self.variational_mean
+        sqrt = self.variational_root_covariance
+        z = self.inducing_inputs
+
+        # Unpack mean function and kernel
+        mean_function = self.posterior.prior.mean_function
+        kernel = self.posterior.prior.kernel
+
+        # Kzz = kernel.gram(z)
+        # Kzz += cola.ops.I_like(Kzz) * self.jitter
+        # Lz = lower_cholesky(Kzz)
+        # muz = mean_function(z)
+
+        # Unpack test inputs
+        t = test_inputs
+
+        Ktt = kernel.gram(t)
+        Kzt = kernel.cross_covariance(z, t)
+        mut = mean_function(t)
+
+        # Lz_inv = jnp.linalg.inv( Lz.to_dense() )
+        # Lz_transpose_inv = jnp.linalg.inv( Lz.T.to_dense() )
+
+        # Lz⁻¹ Kzt
+        Lz_inv_Kzt = Lz_inv @ Kzt   # cola.solve(Lz, Kzt, Cholesky())
+
+        # Kzz⁻¹ Kzt
+        Kzz_inv_Kzt = Lz_inv.T @ Lz_inv_Kzt #  cola.solve(Lz.T, Lz_inv_Kzt, Cholesky())
 
         # Ktz Kzz⁻¹ sqrt
         Ktz_Kzz_inv_sqrt = jnp.matmul(Kzz_inv_Kzt.T, sqrt)
@@ -632,6 +720,8 @@ class ExpectationVariationalGaussian(AbstractVariationalGaussian):
             loc=jnp.atleast_1d(mean.squeeze()), scale=covariance
         )
 
+from functools import partial
+import jax
 
 @dataclass
 class CollapsedVariationalGaussian(AbstractVariationalGaussian):
@@ -661,6 +751,7 @@ class CollapsedVariationalGaussian(AbstractVariationalGaussian):
             GaussianDistribution: The predictive distribution of the collapsed
                 variational Gaussian process at the test inputs $t$.
         """
+        # print(f"HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO five")
         # Unpack test inputs
         t = test_inputs
 
@@ -713,6 +804,110 @@ class CollapsedVariationalGaussian(AbstractVariationalGaussian):
 
         # L⁻¹ Lz⁻¹ Kzt
         L_inv_Lz_inv_Kzt = jsp.linalg.solve_triangular(L, Lz_inv_Kzt, lower=True)
+
+        # μt + 1/o² Ktz Kzz⁻¹ Kzx (y - μx)
+        mean = mut + jnp.matmul(Kzt.T / noise_var, Kzz_inv_Kzx_diff)
+
+        # Ktt  -  Ktz Kzz⁻¹ Kzt  +  Ktz Lz⁻¹ (I + AAᵀ)⁻¹ Lz⁻¹ Kzt
+        covariance = (
+            Ktt
+            - jnp.matmul(Lz_inv_Kzt.T, Lz_inv_Kzt)
+            + jnp.matmul(L_inv_Lz_inv_Kzt.T, L_inv_Lz_inv_Kzt)
+        )
+        covariance += cola.ops.I_like(covariance) * self.jitter
+
+        return GaussianDistribution(
+            loc=jnp.atleast_1d(mean.squeeze()), scale=covariance
+        )
+    
+    def compute_sigma_inv(self, train_data):
+
+        # Unpack training data
+        x, y = train_data.X, train_data.y
+
+        # Unpack variational parameters
+        noise_var = self.posterior.likelihood.obs_stddev**2
+        z = self.inducing_inputs
+        m = self.num_inducing
+
+        # Unpack mean function and kernel
+        mean_function = self.posterior.prior.mean_function
+        kernel = self.posterior.prior.kernel
+
+        Kzx = kernel.cross_covariance(z, x)
+        Kzz = kernel.gram(z)
+        Kzz += cola.ops.I_like(Kzz) * self.jitter
+
+        # Lz Lzᵀ = Kzz
+        Lz = lower_cholesky(Kzz)
+
+        # Lz⁻¹ Kzx
+        Lz_inv_Kzx = cola.solve(Lz, Kzx, Cholesky())
+
+        # A = Lz⁻¹ Kzt / o
+        A = Lz_inv_Kzx / self.posterior.likelihood.obs_stddev
+
+        # AAᵀ
+        AAT = jnp.matmul(A, A.T)
+
+        # LLᵀ = I + AAᵀ
+        L = jnp.linalg.cholesky(jnp.eye(m) + AAT)
+
+        mux = mean_function(x)
+        diff = y - mux
+
+        # Lz⁻¹ Kzx (y - μx)
+        Lz_inv_Kzx_diff = jsp.linalg.cho_solve((L, True), jnp.matmul(Lz_inv_Kzx, diff))
+
+        # Kzz⁻¹ Kzx (y - μx)
+        Kzz_inv_Kzx_diff = cola.solve(Lz.T, Lz_inv_Kzx_diff, Cholesky())
+
+        L_inv = jnp.linalg.inv( L)
+        Lz_inv = jnp.linalg.inv( Lz.to_dense() )
+
+        return L, L_inv, Lz, Lz_inv, Kzz_inv_Kzx_diff
+    
+    # @partial(jax.jit, static_argnums=(0,))
+    def predict_with_sigma_inv(
+        self, test_inputs: Float[Array, "N D"], L, L_inv, Lz, Lz_inv, Kzz_inv_Kzx_diff
+    ) -> GaussianDistribution:
+        r"""Compute the predictive distribution of the GP at the test inputs.
+
+        Args:
+            test_inputs (Float[Array, "N D"]): The test inputs $t$ at which to make
+                predictions.
+            train_data (Dataset): The training data that was used to fit the GP.
+
+        Returns
+        -------
+            GaussianDistribution: The predictive distribution of the collapsed
+                variational Gaussian process at the test inputs $t$.
+        """
+        # print(f"HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO five")
+        # Unpack test inputs
+        t = test_inputs
+
+        # Unpack training data
+        # x, y = train_data.X, train_data.y
+
+        # Unpack variational parameters
+        noise_var = self.posterior.likelihood.obs_stddev**2
+        z = self.inducing_inputs
+        m = self.num_inducing
+
+        # Unpack mean function and kernel
+        mean_function = self.posterior.prior.mean_function
+        kernel = self.posterior.prior.kernel
+
+        Ktt = kernel.gram(t)
+        Kzt = kernel.cross_covariance(z, t)
+        mut = mean_function(t)
+
+        # Lz⁻¹ Kzt
+        Lz_inv_Kzt = Lz_inv @ Kzt #  cola.solve(Lz, Kzt, Cholesky())
+
+        # L⁻¹ Lz⁻¹ Kzt
+        L_inv_Lz_inv_Kzt = L_inv @ Lz_inv_Kzt  #jsp.linalg.solve_triangular(L, Lz_inv_Kzt, lower=True)
 
         # μt + 1/o² Ktz Kzz⁻¹ Kzx (y - μx)
         mean = mut + jnp.matmul(Kzt.T / noise_var, Kzz_inv_Kzx_diff)
